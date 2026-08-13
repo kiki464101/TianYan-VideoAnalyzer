@@ -351,14 +351,36 @@ void FeatureExtractor::analyzeClothing(const cv::Mat &bgrFrame, const cv::Rect &
     }
 
     // ── 下装：类型（裤子/裙子）+ 颜色 ─────────────────────────
+    //   颜色区 0.75-0.92×refH（防鞋色污染）；
+    //   判别区扩到 0.75-1.0×refH（含脚踝，腿缝最宽处）
     if (lowerY2 > lowerY1 && bx2 > bx1 && lowerY1 < bgrFrame.rows) {
         const int l1 = std::max(0, lowerY1);
         const int l2 = std::min(bgrFrame.rows, lowerY2);
         if (l2 > l1) {
             cv::Mat lowerRoi = bgrFrame(cv::Rect(bx1, l1, bx2 - bx1, l2 - l1));
             pf.lowerColor = dominantColorOf(lowerRoi);
-            const double aspect = static_cast<double>(lowerRoi.cols) / std::max(1, lowerRoi.rows);
-            pf.clothingType = aspect > 1.6 ? QStringLiteral("裙子") : QStringLiteral("裤子");
+
+            // ★ 裤裙判别（腿缝列投影法，替代宽高比——宽高比恒>1.6 永远判裙）：
+            //   判别区 = 颜色区底部延伸至人体框底部（含脚踝，腿缝最明显）
+            //   画面截断（判别 ROI 高度 < refH*0.05）→ 跳过下装，不写裤/裙
+            const int g1 = l1;
+            const int g2 = std::min(bgrFrame.rows, refY + refH);
+            if (g2 - g1 >= static_cast<int>(refH * 0.05) && bx2 > bx1) {
+                cv::Mat gray;
+                cv::Mat lowerDisc = bgrFrame(cv::Rect(bx1, g1, bx2 - bx1, g2 - g1));
+                cv::cvtColor(lowerDisc, gray, cv::COLOR_BGR2GRAY);
+
+                const double gap = legGapRatio(gray);    // 主判：腿缝比
+                const double flare = flareRatio(gray);   // 辅判：下摆外扩
+                if (gap < 0.6)
+                    pf.clothingType = QStringLiteral("裤子");
+                else if (gap > 0.8)
+                    pf.clothingType = QStringLiteral("裙子");
+                else
+                    pf.clothingType = (flare > 1.25) ? QStringLiteral("裙子")
+                                                     : QStringLiteral("裤子");
+            }
+            // 截断跳过：clothingType 保持空 → 描述自动不出现下装段
         }
     }
 
@@ -503,4 +525,113 @@ double FeatureExtractor::rectIou(const cv::Rect &a, const cv::Rect &b)
     if (unionArea <= 0.0)
         return 0.0;
     return interArea / unionArea;
+}
+
+// ─────────────────────────────────────────────────────────────
+// ★ 裤裙判别（腿缝列投影法，替代宽高比——宽高比恒>1.6 永远判裙）
+//   核心思想：裤子两条腿之间能看到背景缝（中间布料量少），
+//   裙子布料连续覆盖（中间布料量 ≈ 两侧）。
+// ─────────────────────────────────────────────────────────────
+double FeatureExtractor::legGapRatio(const cv::Mat &grayLower)
+{
+    if (grayLower.cols < 40 || grayLower.rows < 20)
+        return 1.0;   // ROI 太小，无法判别 → 返回"无腿缝"（保守判裙由调用方处理）
+
+    // 布料像素 = 与 ROI 主灰度（直方图峰值）接近的像素（自适应背景）
+    cv::Mat roi;
+    cv::medianBlur(grayLower, roi, 5);   // 中值滤波去噪（输出到局部变量）
+    // 直方图峰值 = 布料主灰度（面积最大的灰度值）
+    const int bins = 256;
+    float range[] = {0.0f, 256.0f};
+    const float *ranges[] = {range};
+    cv::Mat hist;
+    cv::calcHist(&roi, 1, 0, cv::Mat(), hist, 1, &bins, ranges);
+    double maxVal = 0;
+    double minVal = 0;
+    cv::Point minLoc, maxLoc;
+    cv::minMaxLoc(hist, &minVal, &maxVal, &minLoc, &maxLoc);
+    // ★ hist 是 256×1 竖向量：bin 索引在 maxLoc.y（列=0）
+    const double clothGray = static_cast<double>(maxLoc.y);
+    cv::Mat cloth;
+    cv::Mat diff;
+    cv::absdiff(roi, cv::Scalar(clothGray), diff);
+    cv::threshold(diff, cloth, 40, 255, cv::THRESH_BINARY_INV);   // 差<40 = 布料
+
+    // 只看底部 1/3（小腿/脚踝段，腿缝最宽最明显）
+    const int h = cloth.rows;
+    cv::Mat bot = cloth(cv::Rect(0, h * 2 / 3, cloth.cols, h - h * 2 / 3));
+
+    // 列投影：每列布料像素数
+    std::vector<int> colCount(bot.cols, 0);
+    for (int y = 0; y < bot.rows; ++y) {
+        const uchar *row = bot.ptr<uchar>(y);
+        for (int x = 0; x < bot.cols; ++x)
+            if (row[x] > 0)
+                colCount[x]++;
+    }
+
+    // 中间 10% 竖条 vs 两侧腿内竖条（各 ~15%，避开最外侧背景）
+    const int w = bot.cols;
+    const int midL = static_cast<int>(w * 0.45);
+    const int midR = static_cast<int>(w * 0.55);
+    const int sideL = static_cast<int>(w * 0.15);
+    const int sideR = static_cast<int>(w * 0.30);
+    const int sideL2 = static_cast<int>(w * 0.70);
+    const int sideR2 = static_cast<int>(w * 0.85);
+
+    double midSum = 0, sideSum = 0;
+    int midN = 0, sideN = 0;
+    for (int x = midL; x < midR; ++x) { midSum += colCount[x]; midN++; }
+    for (int x = sideL; x < sideR; ++x) { sideSum += colCount[x]; sideN++; }
+    for (int x = sideL2; x < sideR2; ++x) { sideSum += colCount[x]; sideN++; }
+
+    if (midN <= 0 || sideN <= 0)
+        return 1.0;
+    const double midAvg = midSum / midN;
+    const double sideAvg = sideSum / sideN;
+    if (sideAvg <= 1e-6)
+        return 1.0;
+    return midAvg / sideAvg;
+}
+
+double FeatureExtractor::flareRatio(const cv::Mat &grayLower)
+{
+    if (grayLower.cols < 40 || grayLower.rows < 20)
+        return 1.0;
+
+    cv::Mat roi = grayLower.clone();
+    // 直方图峰值 = 布料主灰度
+    const int bins = 256;
+    float range[] = {0.0f, 256.0f};
+    const float *ranges[] = {range};
+    cv::Mat hist;
+    cv::calcHist(&roi, 1, 0, cv::Mat(), hist, 1, &bins, ranges);
+    double maxVal = 0;
+    double minVal = 0;
+    cv::Point minLoc, maxLoc;
+    cv::minMaxLoc(hist, &minVal, &maxVal, &minLoc, &maxLoc);
+    cv::Mat diff;
+    cv::absdiff(roi, cv::Scalar(maxLoc.y), diff);
+    cv::Mat cloth;
+    cv::threshold(diff, cloth, 40, 255, cv::THRESH_BINARY_INV);
+
+    // 底部1/4 与 顶部1/4 的布料水平跨度（每行最左~最右布料距离，取平均）
+    auto rowSpan = [&cloth](int y1, int y2) {
+        double sum = 0; int n = 0;
+        for (int y = y1; y < y2; ++y) {
+            const uchar *row = cloth.ptr<uchar>(y);
+            int first = -1, last = -1;
+            for (int x = 0; x < cloth.cols; ++x)
+                if (row[x] > 0) { if (first < 0) first = x; last = x; }
+            if (first >= 0 && last >= first) { sum += (last - first); n++; }
+        }
+        return n > 0 ? sum / n : 0.0;
+    };
+
+    const int h = cloth.rows;
+    const double topSpan = rowSpan(0, h / 4);
+    const double botSpan = rowSpan(h * 3 / 4, h);
+    if (topSpan <= 1e-6)
+        return 1.0;
+    return botSpan / topSpan;
 }

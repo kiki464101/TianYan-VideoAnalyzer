@@ -76,6 +76,13 @@ private:
     // 纹理判断：对 ROI 做分块颜色差异统计 → 格子/条纹/纯色
     QString textureOf(const cv::Mat &bgrRoi) const;
 
+    // ★ 裤裙判别（腿缝列投影法，替代宽高比）：
+    //   legGapRatio: 判别区底部1/3的中间10%竖条布料量 / 两侧腿内布料量
+    //                 <0.6 裤子(有腿缝)  >0.8 裙子(布料连续)
+    //   flareRatio:  底部1/4布料跨度 / 顶部1/4（A字裙外扩判据 >1.25）
+    static double legGapRatio(const cv::Mat &grayLower);
+    static double flareRatio(const cv::Mat &grayLower);
+
     cv::dnn::Net m_personNet;         // 人体检测网络（MobileNet-SSD）
     cv::dnn::Net m_faceNet;           // 人脸检测网络（ResNet-10 SSD）
     bool m_personInit = false;        // 人体模型是否加载成功
