@@ -51,6 +51,9 @@ public:
     // 不修改原图；内部如需颜色分析会将 ROI 转 HSV 计算
     AnalysisResult analyze(const cv::Mat &bgrFrame);
 
+    // ★ 通用 IoU 计算（跨帧跟踪 / 人脸配对共用）
+    static double rectIou(const cv::Rect &a, const cv::Rect &b);
+
 private:
     // 人体检测（MobileNet-SSD）：返回所有人体框（已 NMS）
     std::vector<cv::Rect> detectPerson(const cv::Mat &bgrFrame);

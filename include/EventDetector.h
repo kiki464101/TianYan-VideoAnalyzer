@@ -70,6 +70,26 @@ private:
     bool     m_lastHasPerson = false;
     bool     m_lastHasFace = false;
     int      m_lastDetectFrame = 0;   // 上次运行 DNN 的帧序号
+
+    // ── ★ 跨帧跟踪（IoU 贪心匹配，简化 SORT） ──
+    struct Track
+    {
+        int      trackId = 0;       // 稳定编号（P1/P2/...），跨帧沿用
+        cv::Rect box;               // 最近一次检测框
+        int      missedFrames = 0;  // 连续未匹配帧数（>5 回收）
+    };
+    std::vector<Track> m_activeTracks;   // 活跃轨迹
+    int m_nextTrackId = 1;               // 自增 ID（reset 后归 1）
+
+    // 新检测框与上帧轨迹做 IoU 贪心匹配；
+    // 输出 outTrackIds[i] = 第 i 个检测框的稳定编号（1 起）
+    void updateTracks(const std::vector<cv::Rect> &personRects,
+                      std::vector<int> &outTrackIds);
+    // 画框时按 IoU 就近取轨迹 ID；无匹配返回 0（调用方降级 "Person"）
+    int trackIdForRect(const cv::Rect &rect) const;
+
+    // 最近一次检测对应的跨帧稳定编号（与 m_lastPersonRects 下标对齐）
+    std::vector<int> m_trackIds;
 };
 
 #endif // EVENTDETECTOR_H

@@ -12,6 +12,7 @@
 | --- | --- |
 | **视频接入** | USB 摄像头 / 本地视频文件；微信 HEVC 视频自动 ffmpeg 转码 MJPG 兜底播放 |
 | **多目标检测** | MobileNet-SSD 人体 + ResNet-10 人脸双 OpenCV DNN 并行检测，NMS 去重，P1/P2 多目标编号 |
+| **跨帧跟踪** | IoU 贪心匹配（简化 SORT）：同一个人跨帧沿用稳定编号，消失 >5 帧轨迹回收，编号从 P1 连续 |
 | **人物特征** | 每人独立分析：上衣/下装/鞋 HSV 颜色分类 + Gabor 4×3 滤波器组条纹/格子纹理识别 |
 | **事件驱动** | MOG2 运动检测 + 轮廓面积阈值触发；DNN 与运动检测解耦（静止人物同样出框）；多人画面共享关键帧、逐人独立事件 |
 | **数据存储** | SQLite WAL 模式 + 批量缓冲写入；`timestamp_ms`（显示）+ `video_position_ms`（帧级定位）双时间戳 |
@@ -36,6 +37,7 @@
 │    人体 MobileNet-SSD 300×300 (conf≥0.3)               │
 │    人脸 ResNet-10 SSD 300×300 (conf≥0.4)               │
 │    NMS 去重 → 多目标框 → 最近人脸配对                    │
+│    跨帧跟踪: IoU 贪心匹配, P 编号跨帧稳定                │
 │    每人: HSV 颜色(上衣/下装/鞋) + Gabor 4×3 纹理         │
 │    共享关键帧(画全部框 + P1/P2 编号)                     │
 └────────────────────────┬───────────────────────────────┘
@@ -68,7 +70,7 @@
 | 文件 | 职责 |
 | --- | --- |
 | `StreamManager` | 视频采集线程：OpenCV VideoCapture 逐帧读取、倍速（原子变量）、seek/暂停、元数据、ffmpeg 转码 fallback |
-| `EventDetector` | 事件引擎：MOG2 运动检测、DNN 检测调度（与运动解耦）、检测框缓存 + `annotateFrame` 实时画框、多事件触发 |
+| `EventDetector` | 事件引擎：MOG2 运动检测、DNN 检测调度（与运动解耦）、检测框缓存 + `annotateFrame` 实时画框、多事件触发；**跨帧跟踪**（IoU 贪心匹配，P 编号跨帧稳定） |
 | `FeatureExtractor` | 双 DNN 推理 + NMS + 最近人脸配对；`analyzeClothing` 三区 HSV 颜色分类；`textureOf` Gabor 4×3 纹理识别 |
 | `DatabaseManager` | SQLite（WAL）+ 内存批量缓冲 + 事务落库；`summaries` 独立表；双路搜索（description + keywords 反查） |
 | `LLMClient` | 异步 POST DeepSeek `/chat/completions`，结构化摘要 + 关键词提取 |
@@ -168,12 +170,26 @@ E:/VideoProject/
 5. **Gabor 纹理识别**：4 方向 × 3 尺度滤波器组 + 响应图标准差 + 正交对对比率，区分条纹/格子/纯色
 6. **SQLite WAL + 批量缓冲**：事件高频写入不阻塞检测线程，事务批量落库
 7. **优雅降级**：模型缺失 / 视频损坏 / API Key 为空，均有 qWarning + UI 提示，不影响其余功能
+8. **跨帧跟踪（简化 SORT）**：新检测框与上帧轨迹 IoU 贪心匹配（>0.3 沿用 ID），未匹配开新轨迹，连续 5 帧未匹配回收——P 编号跨帧稳定，事件描述中的人在同一画面多次出现时编号一致
+
+---
+
+## 📊 性能基准（tools/perf_bench.cpp，本机实测）
+
+> 环境：i7 级 CPU，MinGW Debug 构建，模型 300×300 输入。DNN 耗时与分辨率无关（blob 固定 300×300），MOG2 随分辨率线性增长。
+
+| 分辨率 | 人体检测 | 人脸检测 | 特征提取 | MOG2 | 端到端 | FPS |
+| --- | --- | --- | --- | --- | --- | --- |
+| 360p | ≈38.9ms | ≈24.7ms | ≈7.1ms | ≈13.4ms | 84.0ms | ~12 |
+| 720p | ≈38.1ms | ≈24.2ms | ≈6.9ms | ≈41.0ms | 110.3ms | ~9 |
+| 1080p | ≈37.5ms | ≈23.9ms | ≈6.8ms | ≈47.6ms | 115.8ms | ~9 |
+
+复现：`cd tools && g++ perf_bench.cpp ../src/FeatureExtractor.cpp ../src/EventDetector.cpp <moc> -o perf_bench.exe ... -lopencv_world455 && ./perf_bench.exe`
 
 ---
 
 ## 📌 已知限制 / 待改进
 
-- 跨帧跟踪（同一个人多帧编号稳定性）未实现——当前每帧独立检测 + 最近人脸配对
 - 单视频流模式（`streamId=0`），多流并发为预留设计
-- 检测性能未做基准测试（DNN 推理耗时 / 召回率数据待补充）
+- 跨帧跟踪为 IoU 贪心（无卡尔曼预测 / 外观 ReID）；两人交叉时可能 ID 互换——SORT 类算法通病，可进阶：颜色直方图 ReID 兜底 + 卡尔曼预测
 - 无正式单元测试框架（当前为 ad-hoc 验证脚本）

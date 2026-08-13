@@ -32,6 +32,77 @@ void EventDetector::reset()
     m_lastHasPerson = false;
     m_lastHasFace = false;
     m_lastDetectFrame = 0;
+    // ★ 清空跨帧轨迹（新视频/跳转后编号从 P1 重新开始）
+    m_activeTracks.clear();
+    m_nextTrackId = 1;
+}
+
+// ─────────────────────────────────────────────────────────────
+// ★ 跨帧跟踪（简化 SORT）：IoU 贪心匹配
+//   新检测框与上帧轨迹匹配（IoU>0.3 沿用 ID），未匹配开新轨迹；
+//   未匹配的旧轨迹 missedFrames++，>5 回收
+// ─────────────────────────────────────────────────────────────
+void EventDetector::updateTracks(const std::vector<cv::Rect> &personRects,
+                                 std::vector<int> &outTrackIds)
+{
+    outTrackIds.assign(personRects.size(), 0);
+
+    // 1) 每帧先对旧轨迹 missedFrames 预增（本帧若匹配会清零）
+    for (Track &t : m_activeTracks)
+        t.missedFrames++;
+
+    // 2) IoU 贪心匹配：按 IoU 从大到小依次分配
+    //    对每个新检测框，找 IoU 最大的未分配轨迹
+    std::vector<bool> trackUsed(m_activeTracks.size(), false);
+    for (size_t i = 0; i < personRects.size(); ++i) {
+        double bestIou = 0.0;
+        int bestTrack = -1;
+        for (size_t t = 0; t < m_activeTracks.size(); ++t) {
+            if (trackUsed[t])
+                continue;
+            const double iou = FeatureExtractor::rectIou(personRects[i], m_activeTracks[t].box);
+            if (iou > bestIou) {
+                bestIou = iou;
+                bestTrack = static_cast<int>(t);
+            }
+        }
+        if (bestTrack >= 0 && bestIou > 0.3) {
+            // 沿用轨迹：更新框 + 清零 missed
+            m_activeTracks[bestTrack].box = personRects[i];
+            m_activeTracks[bestTrack].missedFrames = 0;
+            trackUsed[bestTrack] = true;
+            outTrackIds[i] = m_activeTracks[bestTrack].trackId;
+        } else {
+            // 新目标：开新轨迹
+            Track nt;
+            nt.trackId = m_nextTrackId++;
+            nt.box = personRects[i];
+            nt.missedFrames = 0;
+            m_activeTracks.push_back(nt);
+            outTrackIds[i] = nt.trackId;
+        }
+    }
+
+    // 3) 回收长时间未匹配的轨迹（>5 帧）
+    m_activeTracks.erase(
+        std::remove_if(m_activeTracks.begin(), m_activeTracks.end(),
+                       [](const Track &t) { return t.missedFrames > 5; }),
+        m_activeTracks.end());
+}
+
+int EventDetector::trackIdForRect(const cv::Rect &rect) const
+{
+    // 画框时按 IoU 就近取轨迹 ID（annotateFrame 用）
+    double bestIou = 0.0;
+    int bestId = 0;
+    for (const Track &t : m_activeTracks) {
+        const double iou = FeatureExtractor::rectIou(rect, t.box);
+        if (iou > bestIou) {
+            bestIou = iou;
+            bestId = t.trackId;
+        }
+    }
+    return (bestIou > 0.3) ? bestId : 0;
 }
 
 cv::Mat EventDetector::annotateFrame(const cv::Mat &frame)
@@ -40,13 +111,16 @@ cv::Mat EventDetector::annotateFrame(const cv::Mat &frame)
     if (output.empty())
         return output;
 
-    // 所有人体蓝色框（BGR: 255,0,0）
+    // 所有人体蓝色框（BGR: 255,0,0）——★ 标跨帧稳定编号 P<trackId>
     if (m_lastHasPerson) {
         for (const cv::Rect &r : m_lastPersonRects) {
             if (r.width <= 0 || r.height <= 0)
                 continue;
             cv::rectangle(output, r, cv::Scalar(255, 0, 0), 2);
-            cv::putText(output, "Person",
+            const int tid = trackIdForRect(r);
+            const QString tag = (tid > 0) ? QStringLiteral("P%1").arg(tid)
+                                          : QStringLiteral("Person");
+            cv::putText(output, tag.toStdString(),
                         cv::Point(r.x, std::max(20, r.y - 6)),
                         cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 0), 2);
         }
@@ -132,6 +206,10 @@ bool EventDetector::processFrame(int streamId, const cv::Mat &frame)
     m_lastFaceRects = feat.faceRects;
     m_lastDetectFrame = m_frameCount;
 
+    // ★ 跨帧跟踪：检测框更新后立即与上帧轨迹 IoU 匹配，
+    //   trackIds[i] = 第 i 个人体框的稳定编号（跨帧沿用）
+    updateTracks(feat.personRects, m_trackIds);
+
     // 4) 轮廓分析：寻找外部轮廓，过滤小面积噪点
     //    不用 countNonZero 全图统计——远处树叶晃动等小目标会被
     //    外接矩形面积阈值（MIN_CONTOUR_AREA）过滤掉，降低误报
@@ -198,11 +276,13 @@ bool EventDetector::processFrame(int streamId, const cv::Mat &frame)
 
     // 8c) ★ 多人画面：准备共享关键帧（画上所有人的框 + 编号 P1/P2/...）
     //     keyFrame 仅第一条携带，后续事件通过 keyframePath 共享同一张图
+    //     ★ 编号用跨帧稳定 trackId（m_trackIds[i]，替代每帧循环 i+1）
     const qint64 sharedTs = now;
     cv::Mat sharedFrame = frame.clone();   // BGR 深拷贝
     for (size_t i = 0; i < feat.persons.size(); ++i) {
         const auto &pf = feat.persons[i];
-        const QString label = QStringLiteral("P%1").arg(i + 1);
+        const int tid = (i < m_trackIds.size()) ? m_trackIds[i] : static_cast<int>(i + 1);
+        const QString label = QStringLiteral("P%1").arg(tid);
         cv::rectangle(sharedFrame, pf.rect, cv::Scalar(255, 0, 0), 2);
         cv::putText(sharedFrame, label.toStdString(),
                     cv::Point(pf.rect.x, std::max(20, pf.rect.y - 6)),
@@ -219,7 +299,9 @@ bool EventDetector::processFrame(int streamId, const cv::Mat &frame)
     for (size_t i = 0; i < feat.persons.size(); ++i) {
         const auto &pf = feat.persons[i];
         EventRecord one = rec;   // 复用 streamId/ts/ratio/boundingBox
-        one.personIndex = static_cast<int>(i + 1);
+        // ★ personIndex 用跨帧稳定 trackId（替代每帧循环 i+1）
+        const int tid = (i < m_trackIds.size()) ? m_trackIds[i] : static_cast<int>(i + 1);
+        one.personIndex = tid;
         one.keyFrame = (i == 0) ? sharedFrame.clone() : cv::Mat();  // 仅第一条带图
         one.saveKeyFrame = true;
 

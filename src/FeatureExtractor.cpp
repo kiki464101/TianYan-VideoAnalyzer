@@ -492,3 +492,15 @@ QString FeatureExtractor::textureOf(const cv::Mat &bgrRoi) const
         return QStringLiteral("格子");
     return QStringLiteral("条纹");
 }
+
+double FeatureExtractor::rectIou(const cv::Rect &a, const cv::Rect &b)
+{
+    const cv::Rect inter = a & b;
+    const double interArea = static_cast<double>(inter.width) * inter.height;
+    const double areaA = static_cast<double>(a.width) * a.height;
+    const double areaB = static_cast<double>(b.width) * b.height;
+    const double unionArea = areaA + areaB - interArea;
+    if (unionArea <= 0.0)
+        return 0.0;
+    return interArea / unionArea;
+}
