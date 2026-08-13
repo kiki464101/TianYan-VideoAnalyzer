@@ -1,0 +1,32 @@
+# ── 构建产物 ──
+build/
+Desktop_Qt_6_8_3_MinGW_64_bit_Debug/
+*.o
+*.obj
+*.exe
+*.dll
+*.a
+*.lib
+
+# ── 运行时数据 ──
+*.db
+*.db-wal
+*.db-shm
+pics/
+*.avi
+*.mp4
+*.mkv
+*.mov
+
+# ── 模型文件（大文件，用户自行下载） ──
+models/
+*.caffemodel
+*.prototxt
+
+# ── IDE / 系统 ──
+.vscode/
+.idea/
+CMakeLists.txt.user*
+*.user
+Thumbs.db
+.DS_Store
